@@ -131,15 +131,14 @@ Output reveals Ben's host password:
 
 text
 FLOWISE_PASSWORD=F1l3_d0ck3r
-SMTP_PASSWORD=r04D!!_R4ge
-BEN_PASSWORD=F1l3_d0ck3r   # <-- This is the SSH password
+SMTP_PASSWORD=r04D!!_R4ge # <-- This is the SSH password
 2. SSH to the host as ben:
 
 From your attacker machine (not the container):
 
 bash
 ssh ben@10.129.46.17
-# Password: F1l3_d0ck3r
+
 3. Grab the user flag:
 
 bash
